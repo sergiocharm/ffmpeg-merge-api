@@ -8,33 +8,32 @@ import path from "path";
 const app = express();
 app.use(express.json());
 
-// Health check
 app.get("/healthz", (req, res) => res.send("ok"));
 
-app.post("/merge", async (req, res) => {
+app.post("/image-to-video", async (req, res) => {
   try {
-    const { videoUrl, audioUrl } = req.body;
-    if (!videoUrl || !audioUrl) {
-      return res.status(400).send("❌ videoUrl and audioUrl are required");
+    const { imageUrl, audioUrl } = req.body;
+    if (!imageUrl || !audioUrl) {
+      return res.status(400).send("❌ imageUrl and audioUrl are required");
     }
 
     const id = uuidv4();
     const tmpDir = "/tmp";
-    const videoPath = path.join(tmpDir, `${id}-video`);
-    const audioPath = path.join(tmpDir, `${id}-audio`);
+    const imagePath = path.join(tmpDir, `${id}-image`);
+    const audioPath = path.join(tmpDir, `${id}-audio.mp3`);
     const outputPath = path.join(tmpDir, `${id}-output.mp4`);
 
-    // Скачиваем видео через поток
+    // Скачиваем изображение
     await new Promise((resolve, reject) => {
-      fetch(videoUrl).then(resp => {
-        const fileStream = fs.createWriteStream(videoPath);
+      fetch(imageUrl).then(resp => {
+        const fileStream = fs.createWriteStream(imagePath);
         resp.body.pipe(fileStream);
         resp.body.on("error", reject);
         fileStream.on("finish", resolve);
       }).catch(reject);
     });
 
-    // Скачиваем аудио через поток
+    // Скачиваем аудио
     await new Promise((resolve, reject) => {
       fetch(audioUrl).then(resp => {
         const fileStream = fs.createWriteStream(audioPath);
@@ -44,12 +43,11 @@ app.post("/merge", async (req, res) => {
       }).catch(reject);
     });
 
-    // Склеиваем через FFmpeg с явным указанием дорожек
-    const ffmpegCmd = `ffmpeg -y -i "${videoPath}" -i "${audioPath}" -c:v libx264 -c:a aac -map 0:v:0 -map 1:a:0 -shortest "${outputPath}"`;
-
+    // Генерируем видео из картинки и аудио
+    const ffmpegCmd = `ffmpeg -y -loop 1 -i "${imagePath}" -i "${audioPath}" -c:v libx264 -c:a aac -b:a 192k -shortest "${outputPath}"`;
+    
     exec(ffmpegCmd, (error, stdout, stderr) => {
-      // очищаем исходники
-      fs.unlink(videoPath, () => {});
+      fs.unlink(imagePath, () => {});
       fs.unlink(audioPath, () => {});
 
       if (error) {
@@ -57,7 +55,6 @@ app.post("/merge", async (req, res) => {
         return res.status(500).send("FFmpeg error: " + error.message);
       }
 
-      // отправляем готовый mp4
       res.sendFile(outputPath, (err) => {
         fs.unlink(outputPath, () => {});
         if (err) console.error(err);
@@ -71,4 +68,4 @@ app.post("/merge", async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 FFmpeg server running on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Image-to-video server running on port ${PORT}`));
