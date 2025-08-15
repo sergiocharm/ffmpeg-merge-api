@@ -1,93 +1,80 @@
-const express = require("express");
-const fetch = require("node-fetch");
-const fs = require("fs");
-const path = require("path");
-const { exec } = require("child_process");
-const ffmpeg = require("fluent-ffmpeg");
-const { OpenAI } = require("openai");
+import express from "express";
+import fetch from "node-fetch";
+import fs from "fs";
+import path from "path";
+import ffmpeg from "fluent-ffmpeg";
+import { exec } from "child_process";
+import OpenAI from "openai";
 
 const app = express();
 app.use(express.json());
 
-// Инициализация OpenAI
 const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY
+  apiKey: process.env.OPENAI_API_KEY // ОБЯЗАТЕЛЬНО задать ключ
 });
 
-async function downloadFile(url, outputPath) {
+async function downloadFile(url, filename) {
   const res = await fetch(url);
-  if (!res.ok) throw new Error(`Ошибка скачивания ${url}`);
-  const fileStream = fs.createWriteStream(outputPath);
-  await new Promise((resolve, reject) => {
-    res.body.pipe(fileStream);
-    res.body.on("error", reject);
-    fileStream.on("finish", resolve);
-  });
+  const buffer = await res.arrayBuffer();
+  fs.writeFileSync(filename, Buffer.from(buffer));
 }
 
-// Функция транскрибации
-async function transcribeAudio(audioPath) {
+async function transcribeAudioToSRT(audioPath, srtPath) {
+  console.log("⏳ Транскрибируем аудио...");
   const transcription = await openai.audio.transcriptions.create({
     file: fs.createReadStream(audioPath),
-    model: "gpt-4o-mini-transcribe", // можно whisper-1
+    model: "gpt-4o-mini-transcribe",
     response_format: "srt"
   });
-  return transcription;
+  fs.writeFileSync(srtPath, transcription);
+  console.log("✅ Субтитры созданы:", srtPath);
 }
 
 app.post("/merge", async (req, res) => {
   try {
     const { videoUrl, audioUrl } = req.body;
 
-    // Скачиваем файлы
-    const videoPath = path.join(__dirname, "video.mp4");
-    const audioPath = path.join(__dirname, "audio.wav");
-    const mergedPath = path.join(__dirname, "merged.mp4");
-    const srtPath = path.join(__dirname, "subs.srt");
+    const videoPath = path.join("video.mp4");
+    const audioPath = path.join("audio.wav");
+    const mergedPath = path.join("merged.mp4");
+    const srtPath = path.join("subtitles.srt");
+    const finalPath = path.join("final_with_subs.mp4");
 
+    // 1. Скачиваем
     await downloadFile(videoUrl, videoPath);
     await downloadFile(audioUrl, audioPath);
 
-    // Транскрибация аудио
-    console.log("Транскрибируем...");
-    const srtContent = await transcribeAudio(audioPath);
-    fs.writeFileSync(srtPath, srtContent, "utf-8");
-
-    // Накладываем аудио на видео
-    const tempPath = path.join(__dirname, "temp.mp4");
+    // 2. Мёрджим видео и аудио
     await new Promise((resolve, reject) => {
       ffmpeg()
         .input(videoPath)
         .input(audioPath)
-        .outputOptions("-map 0:v", "-map 1:a", "-c:v libx264", "-c:a aac")
-        .save(tempPath)
-        .on("end", resolve)
-        .on("error", reject);
-    });
-
-    // Накладываем субтитры с красивым стилем
-    const fontPath = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"; // на Render обычно есть
-    await new Promise((resolve, reject) => {
-      ffmpeg(tempPath)
-        .outputOptions(`-vf subtitles=${srtPath}:force_style='FontName=DejaVu Sans,FontSize=28,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=0'`)
-        .videoCodec("libx264")
-        .audioCodec("aac")
+        .outputOptions(["-c:v copy", "-c:a aac", "-shortest"])
         .save(mergedPath)
         .on("end", resolve)
         .on("error", reject);
     });
 
-    // Отправляем файл
-    res.download(mergedPath, "final.mp4", () => {
-      [videoPath, audioPath, tempPath, mergedPath, srtPath].forEach(f => {
-        if (fs.existsSync(f)) fs.unlinkSync(f);
-      });
+    // 3. Транскрибируем в .srt
+    await transcribeAudioToSRT(audioPath, srtPath);
+
+    // 4. Накладываем субтитры на видео
+    await new Promise((resolve, reject) => {
+      exec(
+        `ffmpeg -i ${mergedPath} -vf subtitles=${srtPath}:force_style='FontName=Arial,FontSize=24,PrimaryColour=&H00FFFFFF&' -c:a copy ${finalPath}`,
+        (err) => (err ? reject(err) : resolve())
+      );
     });
+
+    // 5. Отправляем результат
+    res.sendFile(path.resolve(finalPath));
 
   } catch (err) {
     console.error(err);
-    res.status(500).send("Ошибка обработки: " + err.message);
+    res.status(500).send("Ошибка: " + err.message);
   }
 });
 
-app.listen(10000, () => console.log("Сервер запущен на порту 10000"));
+app.listen(10000, () => {
+  console.log("✅ Сервер запущен на порту 10000");
+});
