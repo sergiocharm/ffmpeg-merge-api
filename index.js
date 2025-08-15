@@ -1,80 +1,97 @@
-import express from "express";
-import fetch from "node-fetch";
-import fs from "fs";
-import path from "path";
-import ffmpeg from "fluent-ffmpeg";
-import { exec } from "child_process";
-import OpenAI from "openai";
+const express = require("express");
+const multer = require("multer");
+const fetch = require("node-fetch");
+const fs = require("fs");
+const ffmpeg = require("fluent-ffmpeg");
+const { Configuration, OpenAIApi } = require("openai");
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "50mb" }));
 
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY // ОБЯЗАТЕЛЬНО задать ключ
-});
+const upload = multer({ dest: "uploads/" });
 
-async function downloadFile(url, filename) {
+// OpenAI API
+const openai = new OpenAIApi(new Configuration({
+  apiKey: process.env.OPENAI_API_KEY
+}));
+
+// Скачать файл по URL
+async function downloadFile(url, dest) {
   const res = await fetch(url);
-  const buffer = await res.arrayBuffer();
-  fs.writeFileSync(filename, Buffer.from(buffer));
+  if (!res.ok) throw new Error(`Ошибка скачивания ${url}`);
+  const fileStream = fs.createWriteStream(dest);
+  await new Promise((resolve, reject) => {
+    res.body.pipe(fileStream);
+    res.body.on("error", reject);
+    fileStream.on("finish", resolve);
+  });
 }
 
-async function transcribeAudioToSRT(audioPath, srtPath) {
-  console.log("⏳ Транскрибируем аудио...");
-  const transcription = await openai.audio.transcriptions.create({
-    file: fs.createReadStream(audioPath),
+// Транскрибировать аудио в SRT
+async function transcribeToSRT(audioPath, srtPath) {
+  const resp = await openai.audio.transcriptions.create({
     model: "gpt-4o-mini-transcribe",
+    file: fs.createReadStream(audioPath),
     response_format: "srt"
   });
-  fs.writeFileSync(srtPath, transcription);
-  console.log("✅ Субтитры созданы:", srtPath);
+  fs.writeFileSync(srtPath, resp, "utf8");
 }
 
+// /merge — объединяет видео + аудио + субтитры
 app.post("/merge", async (req, res) => {
   try {
     const { videoUrl, audioUrl } = req.body;
+    if (!videoUrl || !audioUrl) {
+      return res.status(400).send("Нужно указать videoUrl и audioUrl");
+    }
 
-    const videoPath = path.join("video.mp4");
-    const audioPath = path.join("audio.wav");
-    const mergedPath = path.join("merged.mp4");
-    const srtPath = path.join("subtitles.srt");
-    const finalPath = path.join("final_with_subs.mp4");
+    fs.mkdirSync("uploads", { recursive: true });
 
-    // 1. Скачиваем
+    const videoPath = `uploads/video.mp4`;
+    const audioPath = `uploads/audio.wav`;
+    const mergedPath = `uploads/merged.mp4`;
+    const srtPath = `uploads/subtitles.srt`;
+    const outputPath = `uploads/output_with_subs.mp4`;
+
+    console.log("⬇️ Скачиваем файлы...");
     await downloadFile(videoUrl, videoPath);
     await downloadFile(audioUrl, audioPath);
 
-    // 2. Мёрджим видео и аудио
+    console.log("🎬 Объединяем видео и аудио...");
     await new Promise((resolve, reject) => {
       ffmpeg()
         .input(videoPath)
         .input(audioPath)
-        .outputOptions(["-c:v copy", "-c:a aac", "-shortest"])
+        .outputOptions("-c:v copy", "-c:a aac")
         .save(mergedPath)
         .on("end", resolve)
         .on("error", reject);
     });
 
-    // 3. Транскрибируем в .srt
-    await transcribeAudioToSRT(audioPath, srtPath);
+    console.log("📝 Делаем транскрипцию...");
+    await transcribeToSRT(audioPath, srtPath);
 
-    // 4. Накладываем субтитры на видео
+    console.log("💬 Вшиваем субтитры...");
     await new Promise((resolve, reject) => {
-      exec(
-        `ffmpeg -i ${mergedPath} -vf subtitles=${srtPath}:force_style='FontName=Arial,FontSize=24,PrimaryColour=&H00FFFFFF&' -c:a copy ${finalPath}`,
-        (err) => (err ? reject(err) : resolve())
-      );
+      ffmpeg(mergedPath)
+        .outputOptions(
+          "-vf",
+          `subtitles=${srtPath}:force_style='FontName=Arial,FontSize=24,PrimaryColour=&H00FFFF&'`
+        )
+        .videoCodec("libx264")
+        .audioCodec("aac")
+        .save(outputPath)
+        .on("end", resolve)
+        .on("error", reject);
     });
 
-    // 5. Отправляем результат
-    res.sendFile(path.resolve(finalPath));
+    console.log("✅ Готово!");
+    res.download(outputPath, "output_with_subs.mp4");
 
   } catch (err) {
-    console.error(err);
-    res.status(500).send("Ошибка: " + err.message);
+    console.error("Ошибка:", err);
+    res.status(500).send(err.message);
   }
 });
 
-app.listen(10000, () => {
-  console.log("✅ Сервер запущен на порту 10000");
-});
+app.listen(10000, () => console.log("🚀 Сервер запущен на порту 10000"));
