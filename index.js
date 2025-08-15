@@ -3,17 +3,16 @@ import fetch from "node-fetch";
 import fs from "fs";
 import path from "path";
 import ffmpeg from "fluent-ffmpeg";
-import { exec } from "child_process";
 import OpenAI from "openai";
 
 const app = express();
 app.use(express.json({ limit: "50mb" }));
 
 const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY // ключ берём из переменных окружения Render
+  apiKey: process.env.OPENAI_API_KEY // берём из переменных окружения Render
 });
 
-// Функция для скачивания файла по URL
+// Функция для скачивания файла
 async function downloadFile(url, dest) {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`Ошибка скачивания ${url}`);
@@ -29,7 +28,7 @@ async function transcribeAudioToSRT(audioPath, srtPath) {
     model: "gpt-4o-mini-transcribe",
     response_format: "srt"
   });
-  fs.writeFileSync(srtPath, transcription);
+  fs.writeFileSync(srtPath, transcription, "utf8");
   console.log("✅ Субтитры созданы:", srtPath);
 }
 
@@ -37,23 +36,21 @@ app.post("/merge", async (req, res) => {
   try {
     const { videoUrl, audioUrl } = req.body;
     if (!videoUrl || !audioUrl) {
-      return res.status(400).send("Укажите videoUrl и audioUrl");
+      return res.status(400).send("Нужно указать videoUrl и audioUrl");
     }
 
     fs.mkdirSync("uploads", { recursive: true });
 
-    const videoPath = path.join("uploads", "video.mp4");
-    const audioPath = path.join("uploads", "audio.wav");
-    const mergedPath = path.join("uploads", "merged.mp4");
-    const srtPath = path.join("uploads", "subtitles.srt");
-    const finalPath = path.join("uploads", "final_with_subs.mp4");
+    const videoPath = path.resolve("uploads", "video.mp4");
+    const audioPath = path.resolve("uploads", "audio.wav");
+    const mergedPath = path.resolve("uploads", "merged.mp4");
+    const srtPath = path.resolve("uploads", "subtitles.srt");
+    const finalPath = path.resolve("uploads", "final_with_subs.mp4");
 
-    // 1. Скачиваем видео и аудио
     console.log("⬇️ Скачиваем файлы...");
     await downloadFile(videoUrl, videoPath);
     await downloadFile(audioUrl, audioPath);
 
-    // 2. Склеиваем видео и аудио
     console.log("🎬 Объединяем видео и аудио...");
     await new Promise((resolve, reject) => {
       ffmpeg()
@@ -65,10 +62,9 @@ app.post("/merge", async (req, res) => {
         .on("error", reject);
     });
 
-    // 3. Транскрибируем аудио
+    // Транскрибируем аудио
     await transcribeAudioToSRT(audioPath, srtPath);
 
-    // 4. Вшиваем субтитры (burn-in)
     console.log("💬 Вшиваем субтитры...");
     await new Promise((resolve, reject) => {
       ffmpeg(mergedPath)
