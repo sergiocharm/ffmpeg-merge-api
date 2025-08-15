@@ -1,50 +1,66 @@
 import express from "express";
 import ffmpeg from "fluent-ffmpeg";
 import ffmpegPath from "@ffmpeg-installer/ffmpeg";
-import multer from "multer";
-import { v4 as uuidv4 } from "uuid";
+import fetch from "node-fetch";
 import fs from "fs";
 import path from "path";
+import { v4 as uuidv4 } from "uuid";
 
 ffmpeg.setFfmpegPath(ffmpegPath.path);
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Настройка multer для загрузки файлов
-const upload = multer({ dest: "uploads/" });
+app.use(express.json({ limit: "200mb" })); // Увеличиваем лимит JSON
 
-// Маршрут для склейки двух видео и наложения аудио
-app.post("/merge", upload.fields([
-  { name: "video1", maxCount: 1 },
-  { name: "video2", maxCount: 1 },
-  { name: "audio", maxCount: 1 }
-]), async (req, res) => {
+// Вспомогательная функция для скачивания файлов
+async function downloadFile(url, dest) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Failed to download ${url}`);
+  const fileStream = fs.createWriteStream(dest);
+  await new Promise((resolve, reject) => {
+    res.body.pipe(fileStream);
+    res.body.on("error", reject);
+    fileStream.on("finish", resolve);
+  });
+  return dest;
+}
+
+app.post("/merge", async (req, res) => {
   try {
-    const video1 = req.files["video1"][0].path;
-    const video2 = req.files["video2"][0].path;
-    const audio = req.files["audio"][0].path;
+    const { video1Url, video2Url, audioUrl } = req.body;
+    if (!video1Url || !video2Url || !audioUrl) {
+      return res.status(400).send("video1Url, video2Url и audioUrl обязательны");
+    }
 
-    const outputFileName = `output-${uuidv4()}.mp4`;
-    const outputPath = path.join("outputs", outputFileName);
-
-    // Создаем папку outputs если нет
+    // Создаем папки если нет
+    if (!fs.existsSync("uploads")) fs.mkdirSync("uploads");
     if (!fs.existsSync("outputs")) fs.mkdirSync("outputs");
+
+    const video1Path = path.join("uploads", `video1-${uuidv4()}.mp4`);
+    const video2Path = path.join("uploads", `video2-${uuidv4()}.mp4`);
+    const audioPath = path.join("uploads", `audio-${uuidv4()}.mp3`);
+
+    // Скачиваем файлы
+    await downloadFile(video1Url, video1Path);
+    await downloadFile(video2Url, video2Path);
+    await downloadFile(audioUrl, audioPath);
+
+    const outputFileName = `merged-${uuidv4()}.mp4`;
+    const outputPath = path.join("outputs", outputFileName);
 
     // Склеиваем видео и накладываем аудио
     ffmpeg()
-      .input(video1)
-      .input(video2)
-      .input(audio)
-      .complexFilter([
-        "[0:v][1:v]concat=n=2:v=1:a=0[v]"
-      ])
+      .input(video1Path)
+      .input(video2Path)
+      .input(audioPath)
+      .complexFilter(["[0:v][1:v]concat=n=2:v=1:a=0[v]"])
       .outputOptions(["-map [v]", "-map 2:a"])
       .save(outputPath)
       .on("end", () => {
         res.download(outputPath, outputFileName, () => {
-          // удаляем временные файлы после отправки
-          [video1, video2, audio, outputPath].forEach(f => fs.unlinkSync(f));
+          // Удаляем временные файлы
+          [video1Path, video2Path, audioPath, outputPath].forEach(f => fs.unlinkSync(f));
         });
       })
       .on("error", (err) => {
@@ -54,7 +70,7 @@ app.post("/merge", upload.fields([
 
   } catch (err) {
     console.error(err);
-    res.status(500).send("Ошибка сервера");
+    res.status(500).send("Ошибка сервера: " + err.message);
   }
 });
 
