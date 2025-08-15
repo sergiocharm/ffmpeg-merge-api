@@ -8,6 +8,7 @@ import path from "path";
 const app = express();
 app.use(express.json());
 
+// Health check
 app.get("/healthz", (req, res) => res.send("ok"));
 
 app.post("/image-to-video", async (req, res) => {
@@ -19,34 +20,33 @@ app.post("/image-to-video", async (req, res) => {
 
     const id = uuidv4();
     const tmpDir = "/tmp";
-    const imagePath = path.join(tmpDir, `${id}-image`);
+    const imagePath = path.join(tmpDir, `${id}-image.png`);
     const audioPath = path.join(tmpDir, `${id}-audio.mp3`);
     const outputPath = path.join(tmpDir, `${id}-output.mp4`);
 
-    // Скачиваем изображение
-    await new Promise((resolve, reject) => {
-      fetch(imageUrl).then(resp => {
-        const fileStream = fs.createWriteStream(imagePath);
+    // Функция для скачивания файла через stream с redirect
+    async function downloadFile(url, destPath) {
+      const resp = await fetch(url, { redirect: "follow" });
+      if (!resp.ok) throw new Error(`Failed to fetch ${url}: ${resp.status}`);
+      await new Promise((resolve, reject) => {
+        const fileStream = fs.createWriteStream(destPath);
         resp.body.pipe(fileStream);
         resp.body.on("error", reject);
         fileStream.on("finish", resolve);
-      }).catch(reject);
-    });
+      });
+      const size = fs.statSync(destPath).size;
+      if (size === 0) throw new Error(`Downloaded file is empty: ${destPath}`);
+    }
 
-    // Скачиваем аудио
-    await new Promise((resolve, reject) => {
-      fetch(audioUrl).then(resp => {
-        const fileStream = fs.createWriteStream(audioPath);
-        resp.body.pipe(fileStream);
-        resp.body.on("error", reject);
-        fileStream.on("finish", resolve);
-      }).catch(reject);
-    });
+    // Скачиваем изображение и аудио
+    await downloadFile(imageUrl, imagePath);
+    await downloadFile(audioUrl, audioPath);
 
     // Генерируем видео из картинки и аудио
     const ffmpegCmd = `ffmpeg -y -loop 1 -i "${imagePath}" -i "${audioPath}" -c:v libx264 -c:a aac -b:a 192k -shortest "${outputPath}"`;
-    
+
     exec(ffmpegCmd, (error, stdout, stderr) => {
+      // очищаем исходники
       fs.unlink(imagePath, () => {});
       fs.unlink(audioPath, () => {});
 
