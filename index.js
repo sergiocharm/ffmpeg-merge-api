@@ -1,62 +1,49 @@
 import express from "express";
+import fetch from "node-fetch";
 import fs from "fs";
-import { pipeline } from "stream";
-import { promisify } from "util";
-import { v4 as uuidv4 } from "uuid";
-import ffmpegInstall from "@ffmpeg-installer/ffmpeg";
 import { exec } from "child_process";
+import { v4 as uuidv4 } from "uuid";
+import path from "path";
 
-const streamPipeline = promisify(pipeline);
 const app = express();
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json());
 
-app.get("/healthz", (_, res) => res.send("ok"));
+// Проверка сервера
+app.get("/healthz", (req, res) => res.send("ok"));
 
 app.post("/merge", async (req, res) => {
   try {
-    const { videoUrl, audioUrl, filename = "output.mp4" } = req.body || {};
+    const { videoUrl, audioUrl } = req.body;
     if (!videoUrl || !audioUrl) {
-      return res.status(400).json({ error: "videoUrl and audioUrl are required" });
+      return res.status(400).send("❌ videoUrl and audioUrl are required");
     }
 
     const id = uuidv4();
-    const tmpDir = `/tmp/${id}`;
-    fs.mkdirSync(tmpDir, { recursive: true });
-    const videoPath = `${tmpDir}/video`;
-    const audioPath = `${tmpDir}/audio`;
-    const outputPath = `${tmpDir}/${filename}`;
+    const tmpDir = "/tmp";
+    const videoPath = path.join(tmpDir, `${id}-video`);
+    const audioPath = path.join(tmpDir, `${id}-audio`);
+    const outputPath = path.join(tmpDir, `${id}-output.mp4`);
 
-    const download = async (url, dest) => {
-      const resp = await fetch(url);
-      if (!resp.ok || !resp.body) {
-        throw new Error(`Download failed ${resp.status} ${resp.statusText}`);
-      }
-      const fileStream = fs.createWriteStream(dest);
-      await streamPipeline(resp.body, fileStream);
-    };
-
-    await download(videoUrl, videoPath);
-    await download(audioUrl, audioPath);
-
-    const ffmpeg = `"${ffmpegInstall.path}"`;
-    const cmd = `${ffmpeg} -y -i "${videoPath}" -i "${audioPath}" -c:v copy -c:a aac -shortest "${outputPath}"`;
-
-    exec(cmd, (error, _stdout, stderr) => {
-      if (error) {
-        console.error(stderr);
-        return res.status(500).json({ error: "FFmpeg error", details: stderr });
-      }
-      res.setHeader("Content-Type", "video/mp4");
-      res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
-      const read = fs.createReadStream(outputPath);
-      read.pipe(res);
-      res.on("finish", () => fs.rmSync(tmpDir, { recursive: true, force: true }));
+    // Скачиваем видео через stream
+    await new Promise((resolve, reject) => {
+      fetch(videoUrl).then(resp => {
+        const fileStream = fs.createWriteStream(videoPath);
+        resp.body.pipe(fileStream);
+        resp.body.on("error", reject);
+        fileStream.on("finish", resolve);
+      }).catch(reject);
     });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: e.message });
-  }
-});
 
-const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`FFmpeg API listening on ${port}`));
+    // Скачиваем аудио через stream
+    await new Promise((resolve, reject) => {
+      fetch(audioUrl).then(resp => {
+        const fileStream = fs.createWriteStream(audioPath);
+        resp.body.pipe(fileStream);
+        resp.body.on("error", reject);
+        fileStream.on("finish", resolve);
+      }).catch(reject);
+    });
+
+    // Склеиваем через FFmpeg (перекодируем на надежный mp4)
+    const ffmpegCmd = `ffmpeg -y -i "${videoPath}" -i "${audioPath}" -c:v libx264 -c:a aac -shortest "${outputPath}"`;
+    exec(ffmpegCmd, (err
