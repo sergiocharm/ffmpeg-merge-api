@@ -11,9 +11,13 @@ app.use(express.json());
 // Health check
 app.get("/healthz", (req, res) => res.send("ok"));
 
-app.post("/image-to-video", async (req, res) => {
+app.post("/merge", async (req, res) => {
   try {
-    const { imageUrl, audioUrl } = req.body;
+    // Если тело приходит строкой, парсим его
+    let body = req.body;
+    if (typeof body === "string") body = JSON.parse(body);
+
+    const { imageUrl, audioUrl } = body;
     if (!imageUrl || !audioUrl) {
       return res.status(400).send("❌ imageUrl and audioUrl are required");
     }
@@ -68,4 +72,4 @@ app.post("/image-to-video", async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 Image-to-video server running on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Image+MP3 to video server running on port ${PORT}`));
