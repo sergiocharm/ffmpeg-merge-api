@@ -46,4 +46,28 @@ app.post("/merge", async (req, res) => {
 
     // Склеиваем через FFmpeg (перекодируем на надежный mp4)
     const ffmpegCmd = `ffmpeg -y -i "${videoPath}" -i "${audioPath}" -c:v libx264 -c:a aac -shortest "${outputPath}"`;
-    exec(ffmpegCmd, (err
+    exec(ffmpegCmd, (error, stdout, stderr) => {
+      // очищаем исходники
+      fs.unlink(videoPath, () => {});
+      fs.unlink(audioPath, () => {});
+
+      if (error) {
+        console.error("FFmpeg error:", stderr);
+        return res.status(500).send("FFmpeg error: " + error.message);
+      }
+
+      // отправляем готовый mp4
+      res.sendFile(outputPath, (err) => {
+        fs.unlink(outputPath, () => {});
+        if (err) console.error(err);
+      });
+    });
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).send("Server error: " + err.message);
+  }
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`🚀 FFmpeg server running on port ${PORT}`));
