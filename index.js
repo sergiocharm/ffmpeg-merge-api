@@ -8,7 +8,7 @@ import path from "path";
 const app = express();
 app.use(express.json());
 
-// Проверка сервера
+// Health check
 app.get("/healthz", (req, res) => res.send("ok"));
 
 app.post("/merge", async (req, res) => {
@@ -24,7 +24,7 @@ app.post("/merge", async (req, res) => {
     const audioPath = path.join(tmpDir, `${id}-audio`);
     const outputPath = path.join(tmpDir, `${id}-output.mp4`);
 
-    // Скачиваем видео через stream
+    // Скачиваем видео через поток
     await new Promise((resolve, reject) => {
       fetch(videoUrl).then(resp => {
         const fileStream = fs.createWriteStream(videoPath);
@@ -34,7 +34,7 @@ app.post("/merge", async (req, res) => {
       }).catch(reject);
     });
 
-    // Скачиваем аудио через stream
+    // Скачиваем аудио через поток
     await new Promise((resolve, reject) => {
       fetch(audioUrl).then(resp => {
         const fileStream = fs.createWriteStream(audioPath);
@@ -44,8 +44,9 @@ app.post("/merge", async (req, res) => {
       }).catch(reject);
     });
 
-    // Склеиваем через FFmpeg (перекодируем на надежный mp4)
-    const ffmpegCmd = `ffmpeg -y -i "${videoPath}" -i "${audioPath}" -c:v libx264 -c:a aac -shortest "${outputPath}"`;
+    // Склеиваем через FFmpeg с явным указанием дорожек
+    const ffmpegCmd = `ffmpeg -y -i "${videoPath}" -i "${audioPath}" -c:v libx264 -c:a aac -map 0:v:0 -map 1:a:0 -shortest "${outputPath}"`;
+
     exec(ffmpegCmd, (error, stdout, stderr) => {
       // очищаем исходники
       fs.unlink(videoPath, () => {});
