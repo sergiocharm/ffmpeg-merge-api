@@ -1,20 +1,16 @@
 import express from "express";
-import fetch from "node-fetch";
+import { exec } from "child_process";
+import { v4 as uuidv4 } from "uuid";
 import fs from "fs";
 import path from "path";
-import ffmpeg from "fluent-ffmpeg";
-import OpenAI from "openai";
-import { v4 as uuidv4 } from "uuid";
 
 const app = express();
-app.use(express.json({ limit: "100mb" }));
+app.use(express.json());
 
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY
-});
+const PORT = process.env.PORT || 3000;
 
-// 📌 Твой список видео (сюда вставишь свои ссылки)
-const VIDEO_POOL = [
+// Список видео
+const videoList = [
 "https://1ogorod.ru/wp-content/uploads/2025/08/vecteezy_daily-oral-care-mouthwash-and-toothbrushes-on-the-counter_58828799_compressed.mp4",
 "https://1ogorod.ru/wp-content/uploads/2025/08/vecteezy_confident-woman-joyfully-signing-papers-after-purchasing-her_66853137_compressed.mp4",
 "https://1ogorod.ru/wp-content/uploads/2025/08/vecteezy_beautiful-young-girl-sitting-on-a-chair-on-the-balcony-and_51429689_compressed.mp4",
@@ -58,133 +54,97 @@ const VIDEO_POOL = [
 "https://1ogorod.ru/wp-content/uploads/2025/08/vecteezy_a-young-caucasian-woman-lies-down-on-the-couch-at-the_69229841_compressed.mp4"
 ];
 
-// Функция скачивания файла
-async function downloadFile(url, dest) {
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`Ошибка скачивания ${url}`);
-  const buffer = await res.arrayBuffer();
-  fs.writeFileSync(dest, Buffer.from(buffer));
-}
+let previousCombos = new Set();
 
-// Получаем длительность файла (в секундах)
-function getDuration(filePath) {
-  return new Promise((resolve, reject) => {
-    ffmpeg.ffprobe(filePath, (err, metadata) => {
-      if (err) reject(err);
-      else resolve(metadata.format.duration);
-    });
-  });
-}
+// Функция случайного выбора видео без повторов комбинаций
+function pickRandomVideosNoRepeats(count) {
+  const pool = [...videoList];
+  let picked = [];
+  let attempt = 0;
 
-// Делаем рандомный выбор видео до нужной длительности
-async function pickRandomVideos(minDuration) {
-  let total = 0;
-  let selected = [];
+  while (picked.length < count && pool.length > 0) {
+    const idx = Math.floor(Math.random() * pool.length);
+    const candidate = pool[idx];
 
-  while (total < minDuration) {
-    const randomUrl = VIDEO_POOL[Math.floor(Math.random() * VIDEO_POOL.length)];
-    const tempPath = path.resolve("uploads", `${uuidv4()}_temp.mp4`);
-    await downloadFile(randomUrl, tempPath);
-    const dur = await getDuration(tempPath);
-    total += dur;
-    selected.push(tempPath);
+    const comboKey = [...picked, candidate].join("|");
+    if (!previousCombos.has(comboKey)) {
+      picked.push(candidate);
+      previousCombos.add(comboKey);
+    }
+
+    pool.splice(idx, 1);
+    attempt++;
+    if (attempt > videoList.length * 2) break; // страховка от зацикливания
   }
 
-  return selected;
+  return picked;
 }
 
-// Преобразуем транскрипт OpenAI в SRT
-function createSRT(transcript) {
-  const lines = transcript.split("\n").filter(l => l.trim());
-  let srt = "";
-  let startTime = 0;
-  const durationPerLine = 3;
-
-  lines.forEach((line, i) => {
-    const endTime = startTime + durationPerLine;
-    const formatTime = t => {
-      const h = String(Math.floor(t / 3600)).padStart(2, "0");
-      const m = String(Math.floor((t % 3600) / 60)).padStart(2, "0");
-      const s = String(Math.floor(t % 60)).padStart(2, "0");
-      const ms = "000";
-      return `${h}:${m}:${s},${ms}`;
-    };
-    srt += `${i + 1}\n${formatTime(startTime)} --> ${formatTime(endTime)}\n${line}\n\n`;
-    startTime = endTime;
-  });
-
-  return srt;
-}
-
-app.post("/merge", async (req, res) => {
+app.post("/render", async (req, res) => {
   try {
     const { audioUrl } = req.body;
-    if (!audioUrl) return res.status(400).send("Нужно указать audioUrl");
+    if (!audioUrl) return res.status(400).json({ error: "audioUrl обязателен" });
 
-    fs.mkdirSync("uploads", { recursive: true });
+    const outFile = path.join("/tmp", `${uuidv4()}.mp4`);
+    const audioFile = path.join("/tmp", `${uuidv4()}.mp3`);
 
-    const audioPath = path.resolve("uploads", `${uuidv4()}_audio.mp3`);
-    const finalVideoPath = path.resolve("uploads", `${uuidv4()}_final.mp4`);
-    const concatListPath = path.resolve("uploads", `${uuidv4()}_list.txt`);
-    const srtPath = path.resolve("uploads", `${uuidv4()}_subtitles.srt`);
-
-    console.log("⬇️ Скачиваем аудио...");
-    await downloadFile(audioUrl, audioPath);
-
-    const audioDuration = await getDuration(audioPath);
-    console.log("🎵 Длительность аудио:", audioDuration);
-
-    console.log("🎥 Подбираем видео...");
-    const videos = await pickRandomVideos(audioDuration + 5);
-
-    console.log("🔗 Объединяем видео...");
-    const listFile = videos.map(v => `file '${v}'`).join("\n");
-    fs.writeFileSync(concatListPath, listFile);
-
-    const mergedVideoPath = path.resolve("uploads", `${uuidv4()}_merged.mp4`);
+    // 1. Скачиваем аудио
     await new Promise((resolve, reject) => {
-      ffmpeg()
-        .input(concatListPath)
-        .inputOptions(["-f concat", "-safe 0"])
-        .outputOptions("-c copy")
-        .save(mergedVideoPath)
-        .on("end", resolve)
-        .on("error", reject);
+      exec(`curl -s -L "${audioUrl}" -o ${audioFile}`, (err) => {
+        if (err) reject("Не удалось скачать аудио");
+        else resolve();
+      });
     });
 
-    console.log("⏳ Транскрибируем аудио...");
-    const transcriptionResult = await openai.audio.transcriptions.create({
-      file: fs.createReadStream(audioPath),
-      model: "gpt-4o-mini-transcribe"
+    // 2. Определяем длину аудио
+    const audioDuration = await new Promise((resolve, reject) => {
+      exec(`ffprobe -i ${audioFile} -show_entries format=duration -v quiet -of csv="p=0"`, (err, stdout) => {
+        if (err) reject("ffprobe ошибка");
+        else resolve(Math.ceil(parseFloat(stdout)));
+      });
     });
 
-    const srtContent = createSRT(transcriptionResult.text);
-    fs.writeFileSync(srtPath, srtContent, "utf8");
+    const targetVideoCount = Math.max(3, Math.ceil(audioDuration / 15)); // 15 сек на видео примерно
+    const selectedVideos = pickRandomVideosNoRepeats(targetVideoCount);
 
-    console.log("🎬 Объединяем финально: видео+аудио+субтитры...");
+    // 3. Скачиваем выбранные видео
+    const localVideos = [];
+    for (const url of selectedVideos) {
+      const localPath = path.join("/tmp", `${uuidv4()}.mp4`);
+      await new Promise((resolve, reject) => {
+        exec(`curl -s -L "${url}" -o ${localPath}`, (err) => {
+          if (err) reject(`Не удалось скачать видео ${url}`);
+          else resolve();
+        });
+      });
+      localVideos.push(localPath);
+    }
+
+    // 4. Создаём list.txt для ffmpeg concat
+    const listFile = path.join("/tmp", `${uuidv4()}.txt`);
+    fs.writeFileSync(listFile, localVideos.map(v => `file '${v}'`).join("\n"));
+
+    // 5. Конкат видео
+    const tempConcat = path.join("/tmp", `${uuidv4()}.mp4`);
     await new Promise((resolve, reject) => {
-      ffmpeg()
-        .input(mergedVideoPath)
-        .input(audioPath)
-        .outputOptions(
-          "-map 0:v:0",
-          "-map 1:a:0",
-          "-c:v libx264",
-          "-c:a aac",
-          "-shortest",
-          `-vf subtitles=${srtPath}:force_style='FontName=Arial,FontSize=28,PrimaryColour=&H00FFFF&,OutlineColour=&H000000&,BorderStyle=1'`
-        )
-        .save(finalVideoPath)
-        .on("end", resolve)
-        .on("error", reject);
+      exec(`ffmpeg -y -f concat -safe 0 -i ${listFile} -c copy ${tempConcat}`, (err) => {
+        if (err) reject("Ошибка concat видео");
+        else resolve();
+      });
     });
 
-    console.log("✅ Готово! Отправляем видео.");
-    res.download(finalVideoPath, "output_with_subs.mp4");
+    // 6. Накладываем аудио и делаем финальный рендер
+    await new Promise((resolve, reject) => {
+      exec(`ffmpeg -y -i ${tempConcat} -i ${audioFile} -c:v copy -c:a aac -shortest ${outFile}`, (err) => {
+        if (err) reject("Ошибка финального рендера");
+        else resolve();
+      });
+    });
+
+    res.download(outFile, "output.mp4");
   } catch (err) {
-    console.error("Ошибка:", err);
-    res.status(500).send(err.message);
+    res.status(500).json({ error: err.toString() });
   }
 });
 
-app.listen(10000, () => console.log("🚀 Сервер запущен на порту 10000"));
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
