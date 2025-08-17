@@ -9,6 +9,19 @@ app.use(express.json({ limit: "100mb" }));
 
 const PORT = process.env.PORT || 3000;
 
+// Проверка ffmpeg/ffprobe
+function checkFFmpeg() {
+  return new Promise((resolve, reject) => {
+    exec("ffmpeg -version", (err) => {
+      if (err) return reject("ffmpeg не найден");
+      exec("ffprobe -version", (err2) => {
+        if (err2) return reject("ffprobe не найден");
+        resolve();
+      });
+    });
+  });
+}
+
 // Список видео
 const videoList = [
 "https://1ogorod.ru/wp-content/uploads/2025/08/vecteezy_daily-oral-care-mouthwash-and-toothbrushes-on-the-counter_58828799_compressed.mp4",
@@ -52,17 +65,20 @@ const videoList = [
 "https://1ogorod.ru/wp-content/uploads/2025/08/vecteezy_close-up-of-the-process-of-caring-for-the-nails-of-the-toes_60331890_compressed.mp4",
 "https://1ogorod.ru/wp-content/uploads/2025/08/vecteezy_businessman-hands-typing-on-laptop-computer-keyboard-close_49071239_compressed.mp4",
 "https://1ogorod.ru/wp-content/uploads/2025/08/vecteezy_a-young-caucasian-woman-lies-down-on-the-couch-at-the_69229841_compressed.mp4"
+ /* твои 44 урла */
 ];
 
-// Рандомный выбор видео
-function pickVideos(targetDuration, count = 5) {
+// Рандомный выбор видео с учётом длины аудио
+function pickVideos(targetDuration, minCount = 5) {
   const pool = [...videoList];
   const picked = [];
+  let totalSeconds = 0;
 
-  while (picked.length < count && pool.length > 0) {
+  while ((totalSeconds < targetDuration || picked.length < minCount) && pool.length > 0) {
     const idx = Math.floor(Math.random() * pool.length);
     picked.push(pool[idx]);
     pool.splice(idx, 1);
+    totalSeconds += 20; // грубая оценка длительности видео, можно потом уточнять
   }
 
   return picked;
@@ -96,7 +112,7 @@ app.post("/merge", async (req, res) => {
       });
     });
 
-    // 3. Подбираем видео (рандом 5 роликов)
+    // 3. Подбираем видео
     const selectedVideos = pickVideos(audioDuration);
     const downloadedVideos = [];
 
@@ -138,4 +154,12 @@ app.post("/merge", async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+// Старт сервера после проверки ffmpeg
+checkFFmpeg()
+  .then(() => {
+    app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+  })
+  .catch(err => {
+    console.error("❌ Ошибка: ", err);
+    process.exit(1);
+  });
