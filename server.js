@@ -46,11 +46,11 @@ let currentVideoIndex = 0;
 
 // Экранирование текста для ffmpeg
 function escapeText(text) {
-  return text
-    .replace(/\\/g, '\\\\\\\\')
-    .replace(/'/g, "'\\\\\\''")
-    .replace(/:/g, '\\:')
-    .replace(/,/g, '\\,');
+  return String(text)
+    .replace(/\\/g, '\\\\\\\\')   // обратные слэши
+    .replace(/'/g, "\\\\'")       // одинарные кавычки
+    .replace(/:/g, '\\:')         // двоеточия
+    .replace(/,/g, '\\,');        // запятые
 }
 
 // Получить следующее видео (циклично)
@@ -64,9 +64,7 @@ function getNextVideo() {
 function cleanupFiles(...files) {
   files.forEach(file => {
     try {
-      if (fs.existsSync(file)) {
-        fs.unlinkSync(file);
-      }
+      if (fs.existsSync(file)) fs.unlinkSync(file);
     } catch (e) {
       console.error(`Не удалось удалить ${file}:`, e.message);
     }
@@ -78,8 +76,7 @@ app.post("/merge", async (req, res) => {
   let videoFile, finalFile;
 
   try {
-    const { text1, text2 } = req.body;
-    
+    const { text1, text2, videoUrl } = req.body || {};
     if (!text1 || !text2) {
       return res.status(400).json({ error: "text1 и text2 обязательны" });
     }
@@ -87,41 +84,53 @@ app.post("/merge", async (req, res) => {
     console.log(`[${new Date().toISOString()}] Новый запрос: text1="${text1}", text2="${text2}"`);
 
     const tmpDir = "/tmp/uploads";
-    if (!fs.existsSync(tmpDir)) {
-      fs.mkdirSync(tmpDir, { recursive: true });
-    }
+    if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
 
-    const videoUrl = getNextVideo();
+    const chosenUrl = videoUrl || getNextVideo();
     videoFile = path.join(tmpDir, `${uuidv4()}.mp4`);
     finalFile = path.join(tmpDir, `${uuidv4()}_final.mp4`);
 
-    console.log(`[${Date.now() - startTime}ms] Скачивание: ${videoUrl}`);
+    console.log(`[${Date.now() - startTime}ms] Скачивание: ${chosenUrl}`);
 
-    // 1. Скачиваем видео с таймаутом
-    await execPromise(`curl -s -L --max-time 30 "${videoUrl}" -o ${videoFile}`);
-    
+    // 1) Скачиваем видео (таймаут curl 30с)
+    await execPromise(`curl -s -L --max-time 30 "${chosenUrl}" -o "${videoFile}"`);
     if (!fs.existsSync(videoFile) || fs.statSync(videoFile).size === 0) {
       throw new Error("Файл не скачался");
     }
-
     console.log(`[${Date.now() - startTime}ms] Скачано: ${fs.statSync(videoFile).size} bytes`);
 
-    // 2. Экранируем тексты
+    // 2) Проверяем шрифт Montserrat
+    const fontPath = path.resolve("", "Montserrat-Regular.ttf");
+    if (!fs.existsSync(fontPath)) {
+      return res.status(500).json({ error: "Нет шрифта fonts/Montserrat-Regular.ttf" });
+    }
+
+    // 3) Экранируем тексты
     const safeText1 = escapeText(text1);
     const safeText2 = escapeText(text2);
 
-    // 3. Упрощённая команда ffmpeg (без сложных фильтров)
-    const ffmpegCmd = `ffmpeg -y -i ${videoFile} -t 10 \
--vf "drawtext=text='${safeText1}':fontsize=36:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=12:x=(w-text_w)/2:y=70,\
-drawtext=text='${safeText2}':fontsize=36:fontcolor=yellow:x=(w-text_w)/2:y=130:enable='gte(t,3)'" \
--c:a copy -preset ultrafast ${finalFile}`;
+    // 4) Продвинутый filter_complex: размытие области + полупрозрачный бокс + тексты
+    // Геометрия:
+    //   - панель шириной 90% кадра, высотой 160px, отступ сверху 80px;
+    //   - Text1 белый сразу; Text2 жёлтый с 3-й секунды;
+    //   - аудио копируем из источника; на всякий случай ограничиваем длительность -t 10.
+    const filter = [
+      "[0:v]trim=0:10,setsar=1,format=yuv420p,split=2[base][b];",
+      "[b]boxblur=luma_radius=20:luma_power=1[bblur];",
+      "[bblur]crop=w=iw*0.9:h=160:x=iw*0.05:y=80[panel];",
+      "[base][panel]overlay=x=(W-w)/2:y=80[o1];",
+      "[o1]drawbox=x=(w*0.05):y=80:w=(w*0.9):h=160:color=black@0.45:t=fill[o2];",
+      `[o2]drawtext=fontfile='${fontPath}':text='${safeText1}':fontcolor=white:fontsize=40:x=(w-text_w)/2:y=100:enable='between(t,0,10)'[t1];`,
+      `[t1]drawtext=fontfile='${fontPath}':text='${safeText2}':fontcolor=yellow:fontsize=38:x=(w-text_w)/2:y=145:enable='between(t,3,10)'[vout]`
+    ].join(" ");
+
+    const ffmpegCmd = `ffmpeg -y -t 10 -i "${videoFile}" -filter_complex "${filter}" ` +
+                      `-map "[vout]" -map 0:a? -c:v libx264 -crf 18 -preset veryfast -c:a copy -shortest -movflags +faststart "${finalFile}"`;
 
     console.log(`[${Date.now() - startTime}ms] Запуск ffmpeg...`);
-
-    // 4. Обработка с таймаутом 50 секунд
-    const { stderr } = await execPromise(ffmpegCmd, { 
-      maxBuffer: 10 * 1024 * 1024,
-      timeout: 50000 
+    const { stderr } = await execPromise(ffmpegCmd, {
+      maxBuffer: 20 * 1024 * 1024,
+      timeout: 60000
     });
 
     if (!fs.existsSync(finalFile) || fs.statSync(finalFile).size === 0) {
@@ -131,11 +140,9 @@ drawtext=text='${safeText2}':fontsize=36:fontcolor=yellow:x=(w-text_w)/2:y=130:e
 
     console.log(`[${Date.now() - startTime}ms] Готово: ${fs.statSync(finalFile).size} bytes`);
 
-    // 5. Отправляем результат
+    // 5) Отдаём файл
     res.download(finalFile, "video_with_text.mp4", (err) => {
-      if (err) {
-        console.error("Ошибка отправки:", err);
-      }
+      if (err) console.error("Ошибка отправки:", err);
       console.log(`[${Date.now() - startTime}ms] Отправлено. Очистка...`);
       cleanupFiles(videoFile, finalFile);
     });
@@ -143,8 +150,7 @@ drawtext=text='${safeText2}':fontsize=36:fontcolor=yellow:x=(w-text_w)/2:y=130:e
   } catch (e) {
     console.error(`[${Date.now() - startTime}ms] ОШИБКА:`, e.message);
     cleanupFiles(videoFile, finalFile);
-    
-    res.status(500).json({ 
+    res.status(500).json({
       error: e.message,
       details: e.toString(),
       time: `${Date.now() - startTime}ms`
@@ -154,8 +160,8 @@ drawtext=text='${safeText2}':fontsize=36:fontcolor=yellow:x=(w-text_w)/2:y=130:e
 
 // Health check
 app.get("/", (req, res) => {
-  res.json({ 
-    status: "OK", 
+  res.json({
+    status: "OK",
     videos: videoList.length,
     current: currentVideoIndex,
     uptime: process.uptime()
