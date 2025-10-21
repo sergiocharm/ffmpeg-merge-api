@@ -3,7 +3,9 @@ import { exec } from "child_process";
 import { v4 as uuidv4 } from "uuid";
 import fs from "fs";
 import path from "path";
+import { promisify } from "util";
 
+const execPromise = promisify(exec);
 const app = express();
 app.use(express.json());
 
@@ -42,27 +44,12 @@ const videoList = [
 
 let currentVideoIndex = 0;
 
-// Проверка ffmpeg/ffprobe
-function checkFFmpeg() {
-  return new Promise((resolve, reject) => {
-    exec("ffmpeg -version", (err) => {
-      if (err) return reject("ffmpeg не найден");
-      exec("ffprobe -version", (err2) => {
-        if (err2) return reject("ffprobe не найден");
-        resolve();
-      });
-    });
-  });
-}
-
 // Экранирование текста для ffmpeg
 function escapeText(text) {
   return text
-    .replace(/\\/g, '\\\\')
-    .replace(/'/g, "\\'")
+    .replace(/\\/g, '\\\\\\\\')
+    .replace(/'/g, "'\\\\\\''")
     .replace(/:/g, '\\:')
-    .replace(/\[/g, '\\[')
-    .replace(/\]/g, '\\]')
     .replace(/,/g, '\\,');
 }
 
@@ -73,7 +60,23 @@ function getNextVideo() {
   return video;
 }
 
+// Очистка старых файлов
+function cleanupFiles(...files) {
+  files.forEach(file => {
+    try {
+      if (fs.existsSync(file)) {
+        fs.unlinkSync(file);
+      }
+    } catch (e) {
+      console.error(`Не удалось удалить ${file}:`, e.message);
+    }
+  });
+}
+
 app.post("/merge", async (req, res) => {
+  const startTime = Date.now();
+  let videoFile, finalFile;
+
   try {
     const { text1, text2 } = req.body;
     
@@ -81,93 +84,90 @@ app.post("/merge", async (req, res) => {
       return res.status(400).json({ error: "text1 и text2 обязательны" });
     }
 
-    fs.mkdirSync("/tmp/uploads", { recursive: true });
+    console.log(`[${new Date().toISOString()}] Новый запрос: text1="${text1}", text2="${text2}"`);
+
+    const tmpDir = "/tmp/uploads";
+    if (!fs.existsSync(tmpDir)) {
+      fs.mkdirSync(tmpDir, { recursive: true });
+    }
 
     const videoUrl = getNextVideo();
-    const videoFile = path.join("/tmp/uploads", `${uuidv4()}.mp4`);
-    const finalFile = path.join("/tmp/uploads", `${uuidv4()}_final.mp4`);
+    videoFile = path.join(tmpDir, `${uuidv4()}.mp4`);
+    finalFile = path.join(tmpDir, `${uuidv4()}_final.mp4`);
 
-    console.log(`Выбрано видео: ${videoUrl}`);
+    console.log(`[${Date.now() - startTime}ms] Скачивание: ${videoUrl}`);
 
-    // 1. Скачиваем видео
-    await new Promise((resolve, reject) => {
-      exec(`curl -s -L "${videoUrl}" -o ${videoFile}`, (err) => {
-        if (err) reject("Не удалось скачать видео");
-        else resolve();
-      });
-    });
+    // 1. Скачиваем видео с таймаутом
+    await execPromise(`curl -s -L --max-time 30 "${videoUrl}" -o ${videoFile}`);
+    
+    if (!fs.existsSync(videoFile) || fs.statSync(videoFile).size === 0) {
+      throw new Error("Файл не скачался");
+    }
+
+    console.log(`[${Date.now() - startTime}ms] Скачано: ${fs.statSync(videoFile).size} bytes`);
 
     // 2. Экранируем тексты
     const safeText1 = escapeText(text1);
     const safeText2 = escapeText(text2);
 
-    // 3. Создаём фильтр для текстов
-    // text1: белый на размытом чёрном фоне, сверху, с начала видео
-    // text2: жёлтый, под text1, появляется с 3-й секунды
-    const fontPath = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"; // Montserrat может не быть, используем DejaVu как fallback
-    
-    const filterComplex = `
-[0:v]trim=duration=10,setpts=PTS-STARTPTS[trimmed];
-[trimmed]drawtext=text='${safeText1}':fontfile=${fontPath}:fontsize=38:fontcolor=white:
-box=1:boxcolor=black@0.6:boxborderw=15:
-x=(w-text_w)/2:y=80:
-enable='between(t,0,10)'[text1];
-[text1]drawtext=text='${safeText2}':fontfile=${fontPath}:fontsize=38:fontcolor=yellow:
-x=(w-text_w)/2:y=140:
-enable='between(t,3,10)'[output]
-`.replace(/\n/g, '');
+    // 3. Упрощённая команда ffmpeg (без сложных фильтров)
+    const ffmpegCmd = `ffmpeg -y -i ${videoFile} -t 10 \
+-vf "drawtext=text='${safeText1}':fontsize=36:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=12:x=(w-text_w)/2:y=70,\
+drawtext=text='${safeText2}':fontsize=36:fontcolor=yellow:x=(w-text_w)/2:y=130:enable='gte(t,3)'" \
+-c:a copy -preset ultrafast ${finalFile}`;
 
-    // 4. Применяем обрезку до 10 сек и накладываем текст
-    await new Promise((resolve, reject) => {
-      const cmd = `ffmpeg -y -i ${videoFile} -filter_complex "${filterComplex}" -map "[output]" -map 0:a? -t 10 -c:a copy ${finalFile}`;
-      
-      console.log("Команда ffmpeg:", cmd);
-      
-      exec(cmd, (err, stdout, stderr) => {
-        if (err) {
-          console.error("Ошибка ffmpeg:", stderr);
-          reject("Ошибка наложения текста");
-        } else {
-          resolve();
-        }
-      });
+    console.log(`[${Date.now() - startTime}ms] Запуск ffmpeg...`);
+
+    // 4. Обработка с таймаутом 50 секунд
+    const { stderr } = await execPromise(ffmpegCmd, { 
+      maxBuffer: 10 * 1024 * 1024,
+      timeout: 50000 
     });
+
+    if (!fs.existsSync(finalFile) || fs.statSync(finalFile).size === 0) {
+      console.error("ffmpeg stderr:", stderr);
+      throw new Error("ffmpeg не создал выходной файл");
+    }
+
+    console.log(`[${Date.now() - startTime}ms] Готово: ${fs.statSync(finalFile).size} bytes`);
 
     // 5. Отправляем результат
     res.download(finalFile, "video_with_text.mp4", (err) => {
-      // Очистка временных файлов
-      try {
-        fs.unlinkSync(videoFile);
-        fs.unlinkSync(finalFile);
-      } catch (e) {
-        console.error("Ошибка удаления файлов:", e);
+      if (err) {
+        console.error("Ошибка отправки:", err);
       }
+      console.log(`[${Date.now() - startTime}ms] Отправлено. Очистка...`);
+      cleanupFiles(videoFile, finalFile);
     });
 
   } catch (e) {
-    console.error("Ошибка обработки:", e);
-    res.status(500).json({ error: e.toString() });
+    console.error(`[${Date.now() - startTime}ms] ОШИБКА:`, e.message);
+    cleanupFiles(videoFile, finalFile);
+    
+    res.status(500).json({ 
+      error: e.message,
+      details: e.toString(),
+      time: `${Date.now() - startTime}ms`
+    });
   }
 });
 
-// Health check endpoint
+// Health check
 app.get("/", (req, res) => {
   res.json({ 
     status: "OK", 
-    videosTotal: videoList.length,
-    currentIndex: currentVideoIndex 
+    videos: videoList.length,
+    current: currentVideoIndex,
+    uptime: process.uptime()
   });
 });
 
-// Старт сервера после проверки ffmpeg
-checkFFmpeg()
-  .then(() => {
-    app.listen(PORT, () => {
-      console.log(`🚀 Server running on port ${PORT}`);
-      console.log(`📹 Loaded ${videoList.length} videos`);
-    });
-  })
-  .catch(err => {
-    console.error("❌ Ошибка: ", err);
-    process.exit(1);
-  });
+app.get("/health", (req, res) => {
+  res.json({ status: "healthy" });
+});
+
+// Запуск сервера
+app.listen(PORT, () => {
+  console.log(`🚀 Server started on port ${PORT}`);
+  console.log(`📹 Videos loaded: ${videoList.length}`);
+});
